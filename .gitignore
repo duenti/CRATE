@@ -38,3 +38,8 @@ temp/
 crate-backup*.json
 exports/
 backups/
+
+# Project input and reference material kept locally
+mockups/
+7inches-DJ.csv
+NEXT-TASKS.md

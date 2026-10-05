@@ -1,0 +1,40 @@
+# System files
+.DS_Store
+Thumbs.db
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# JavaScript dependencies and build artifacts
+node_modules/
+dist/
+build/
+.cache/
+.parcel-cache/
+
+# Python/local server artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Local environment configuration
+.env
+.env.*
+!.env.example
+
+# Application-local backups and exports
+crate-backup*.json
+exports/
+backups/

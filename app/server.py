@@ -149,6 +149,7 @@ def database_state(db: sqlite3.Connection) -> dict:
         if item["ended_at"] is not None:
             payload["endedAt"] = item["ended_at"]
         if item["status"] == "active":
+            payload["explicit"] = True
             active_set = payload
         else:
             finished_sets.append(payload)

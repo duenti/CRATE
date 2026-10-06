@@ -1,0 +1,1 @@
+"""CRATE local application package."""

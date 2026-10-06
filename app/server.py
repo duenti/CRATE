@@ -25,9 +25,8 @@ TRACK_FIELDS = {
     "Acousticness": "acousticness", "Instrumentalness": "instrumentalness", "Liveness": "liveness",
     "Valence": "valence", "Tempo": "tempo", "Time Signature": "time_signature", "Side (A/B)": "side",
     "DJ Energy (1–5)": "dj_energy", "Funkiness (1–5)": "funkiness", "Heaviness (1–5)": "heaviness",
-    "Psychedelia (1–5)": "psychedelia", "Groove": "groove", "Mood": "mood", "Vocals": "vocals",
-    "Vocal Intensity (0–3)": "vocal_intensity", "Intro": "intro", "Outro": "outro",
-    "Mixability (1–5)": "mixability", "Set Role": "set_role", "DJ Rating (1–5)": "dj_rating",
+    "Psychedelia (1–5)": "psychedelia", "Vocal Intensity (0–3)": "vocal_intensity",
+    "Mixability (1–5)": "mixability", "DJ Rating (1–5)": "dj_rating",
     "DJ Notes": "dj_notes", "Goes Well Into": "goes_well_into",
 }
 REVERSE_TRACK_FIELDS = {value: key for key, value in TRACK_FIELDS.items()}
@@ -40,8 +39,7 @@ CREATE TABLE IF NOT EXISTS tracks (
   popularity REAL, danceability REAL, spotify_energy REAL, spotify_key INTEGER, loudness REAL,
   spotify_mode INTEGER, speechiness REAL, acousticness REAL, instrumentalness REAL, liveness REAL,
   valence REAL, tempo REAL, time_signature INTEGER, side TEXT, dj_energy INTEGER, funkiness INTEGER,
-  heaviness INTEGER, psychedelia INTEGER, groove TEXT, mood TEXT, vocals TEXT, vocal_intensity INTEGER,
-  intro TEXT, outro TEXT, mixability INTEGER, set_role TEXT, dj_rating INTEGER, dj_notes TEXT,
+  heaviness INTEGER, psychedelia INTEGER, vocal_intensity INTEGER, mixability INTEGER, dj_rating INTEGER, dj_notes TEXT,
   goes_well_into TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS genres (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, color TEXT);
@@ -50,6 +48,18 @@ CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQ
 CREATE TABLE IF NOT EXISTS track_genres (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, genre_id INTEGER NOT NULL REFERENCES genres(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, genre_id));
 CREATE TABLE IF NOT EXISTS track_styles (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, style_id INTEGER NOT NULL REFERENCES styles(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, style_id));
 CREATE TABLE IF NOT EXISTS track_tags (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, tag_id));
+CREATE TABLE IF NOT EXISTS moods (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS grooves (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS vocals (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS set_roles (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS intros (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS outros (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS track_moods (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, mood_id INTEGER NOT NULL REFERENCES moods(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, mood_id));
+CREATE TABLE IF NOT EXISTS track_grooves (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, groove_id INTEGER NOT NULL REFERENCES grooves(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, groove_id));
+CREATE TABLE IF NOT EXISTS track_vocals (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, vocal_id INTEGER NOT NULL REFERENCES vocals(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, vocal_id));
+CREATE TABLE IF NOT EXISTS track_set_roles (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, set_role_id INTEGER NOT NULL REFERENCES set_roles(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, set_role_id));
+CREATE TABLE IF NOT EXISTS track_intros (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, intro_id INTEGER NOT NULL REFERENCES intros(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, intro_id));
+CREATE TABLE IF NOT EXISTS track_outros (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, outro_id INTEGER NOT NULL REFERENCES outros(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, outro_id));
 CREATE TABLE IF NOT EXISTS crates (id TEXT PRIMARY KEY, name TEXT NOT NULL, default_tonight INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS crate_tracks (crate_id TEXT NOT NULL REFERENCES crates(id) ON DELETE CASCADE, track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(crate_id, track_id));
 CREATE TABLE IF NOT EXISTS sets (id TEXT PRIMARY KEY, crate_id TEXT REFERENCES crates(id) ON DELETE SET NULL, name TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','finished','cancelled')), started_at INTEGER NOT NULL, ended_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
@@ -63,6 +73,23 @@ CREATE INDEX IF NOT EXISTS idx_crate_tracks_track ON crate_tracks(track_id);
 
 GENRE_COLORS = {"Blues":"#427BB8","Brass & Military":"#89965B","Children's":"#F4D35E","Classical":"#E5DCC5","Electronic":"#35C9D0","Folk, World, & Country":"#C88765","Funk / Soul":"#E99A35","Hip-Hop":"#9467D8","Jazz":"#459A92","Latin":"#F07868","Non-Music":"#929AA6","Pop":"#EC79B5","Reggae":"#68B866","Rock":"#D95757","Stage & Screen":"#BCA164"}
 
+ENUM_VALUES = {
+    "moods": ["Upbeat", "Warm", "Sunny", "Playful", "Celebratory", "Uplifting", "Euphoric", "Sultry", "Smooth", "Laid-back", "Hypnotic", "Dreamy", "Spacious", "Reflective", "Moody", "Dark", "Gritty", "Urgent", "Defiant", "Dramatic", "Futuristic", "Cool", "Rowdy"],
+    "grooves": ["Straight", "Syncopated", "Four-on-the-floor", "Shuffle", "Swing", "Offbeat / Skank", "Breakbeat", "Latin / Clave", "Polyrhythmic", "Loose", "Driving", "Half-time", "Free / Rubato"],
+    "vocals": ["Instrumental", "Mostly instrumental", "Sung", "Spoken", "Rap", "Chants", "Vocoder", "Wordless vocals"],
+    "set_roles": ["Opener", "Warm-up", "Builder", "Peak", "Bridge", "Reset", "Closer"],
+    "intros": ["Drums / Percussion", "Bass-led", "Guitar-led", "Keys / Synth-led", "Horns-led", "Full-band", "Vocal-first", "Spoken", "Atmospheric", "Gradual build", "Cold start"],
+    "outros": ["Fade-out", "Cold ending", "Instrumental tail", "Vocal ending", "Break / Stop", "Gradual breakdown"],
+}
+
+ENUM_ALIASES = {
+    "moods": {"Bright":"Sunny", "Cheeky":"Playful", "Driving":"Urgent", "Earthy":"Warm", "Edgy":"Gritty", "Empowering":"Uplifting", "Explosive":"Euphoric", "Exuberant":"Celebratory", "Friendly":"Warm", "Party":"Celebratory", "Punchy":"Urgent", "Slinky":"Smooth", "Soulful":"Warm", "Streetwise":"Cool", "Triumphant":"Celebratory"},
+    "grooves": {"Four-on-the-floor / syncopated":"Four-on-the-floor; Syncopated", "Loose / syncopated":"Loose; Syncopated", "Offbeat / skank":"Offbeat / Skank", "Percussive / syncopated":"Syncopated", "Straight rock / backbeat":"Straight", "Syncopated funk":"Syncopated"},
+    "vocals": {"Spoken / sung":"Spoken; Sung", "Vocal":"Sung"},
+    "set_roles": {"Warm-up / Builder":"Warm-up; Builder", "Warm-up / Reset":"Warm-up; Reset"},
+    "intros": {"Atmospheric instrumental textures (verify edit)":"Atmospheric", "Bass-led instrumental groove (verify edit)":"Bass-led", "Dramatic instrumental theme / build (verify edit)":"Gradual build", "Guitar riff / vocal chant (verify edit)":"Guitar-led", "Guitar-led instrumental riff (verify edit)":"Guitar-led", "High guitar motif / instrumental groove (verify edit)":"Guitar-led", "Immediate vocal entrance (verify edit)":"Vocal-first", "Instrumental psychedelic motif (verify edit)":"Atmospheric", "Orchestral Beethoven motif (verify edit)":"Full-band", "Organ-led riff (verify edit)":"Keys / Synth-led", "Percussion-led instrumental groove (verify edit)":"Drums / Percussion", "Synth sequencer / electronic beat (verify edit)":"Keys / Synth-led"},
+}
+
 
 def connect() -> sqlite3.Connection:
     DATA_DIR.mkdir(exist_ok=True)
@@ -74,6 +101,36 @@ def connect() -> sqlite3.Connection:
 
 def split_values(value: object) -> list[str]:
     return [part.strip() for part in str(value or "").split(";") if part.strip()]
+
+
+def split_enum_values(value: object, enum_table: str) -> list[str]:
+    """Split semicolon values and legacy slash-separated values safely."""
+    known = {name.casefold(): name for name in ENUM_VALUES.get(enum_table, [])}
+    result = []
+    aliases = ENUM_ALIASES.get(enum_table, {})
+    for part in split_values(value):
+        alias = aliases.get(part) or aliases.get(part.title())
+        if alias:
+            result.extend(split_values(alias))
+            continue
+        if part.casefold() in known:
+            result.append(known[part.casefold()])
+            continue
+        pieces = [piece.strip() for piece in part.split("/") if piece.strip()]
+        result.extend(known.get(piece.casefold(), piece) for piece in pieces)
+    return result
+
+
+def allowed_values(entity_table: str) -> set[str] | None:
+    if entity_table in ENUM_VALUES:
+        return set(ENUM_VALUES[entity_table])
+    if entity_table == "genres":
+        return set(GENRE_COLORS)
+    if entity_table == "styles":
+        styles_file = APP_DIR / "styles.json"
+        if styles_file.exists():
+            return set(json.loads(styles_file.read_text(encoding="utf-8")))
+    return None
 
 
 def value_or_none(value: object) -> object:
@@ -89,6 +146,41 @@ def initialise_database() -> None:
         if styles_file.exists():
             for name in json.loads(styles_file.read_text(encoding="utf-8")):
                 db.execute("INSERT OR IGNORE INTO styles(name) VALUES (?)", (name,))
+        for table, values in ENUM_VALUES.items():
+            for name in values:
+                db.execute(f"INSERT OR IGNORE INTO {table}(name) VALUES (?)", (name,))
+        # Migrate values from the original scalar columns into the normalized
+        # N–M tables. The scalar columns remain for backward compatibility.
+        relation_specs = [("Groove", "groove", "track_grooves", "grooves"), ("Mood", "mood", "track_moods", "moods"), ("Vocals", "vocals", "track_vocals", "vocals"), ("Set Role", "set_role", "track_set_roles", "set_roles"), ("Intro", "intro", "track_intros", "intros"), ("Outro", "outro", "track_outros", "outros")]
+        track_columns = {row["name"] for row in db.execute("PRAGMA table_info(tracks)")}
+        legacy_columns = [column for _, column, _, _ in relation_specs if column in track_columns]
+        select_columns = ", ".join(["id", *legacy_columns])
+        for row in db.execute(f"SELECT {select_columns} FROM tracks"):
+            for label, column, relation_table, entity_table in relation_specs:
+                if column not in track_columns:
+                    continue
+                if not db.execute(f"SELECT 1 FROM {relation_table} WHERE track_id = ? LIMIT 1", (row["id"],)).fetchone():
+                    write_relation(db, relation_table, entity_table, row["id"], split_enum_values(row[column], entity_table))
+        for column in legacy_columns:
+            db.execute(f"ALTER TABLE tracks DROP COLUMN {column}")
+        # Normalize legacy slash-delimited relation values such as
+        # "Four-on-the-floor / syncopated" into two enum rows.
+        for _, _, relation_table, entity_table in relation_specs:
+            entity_id = f"{entity_table[:-1]}_id"
+            for track in db.execute(f"SELECT DISTINCT track_id FROM {relation_table}"):
+                names = [item["name"] for item in db.execute(f"SELECT e.name FROM {relation_table} r JOIN {entity_table} e ON e.id = r.{entity_id} WHERE r.track_id = ? ORDER BY r.position", (track["track_id"],))]
+                normalized = split_enum_values("; ".join(names), entity_table)
+                if normalized != names:
+                    write_relation(db, relation_table, entity_table, track["track_id"], normalized)
+            canonical = ENUM_VALUES.get(entity_table, [])
+            placeholders = ",".join("?" for _ in canonical)
+            if canonical:
+                db.execute(f"DELETE FROM {entity_table} WHERE id NOT IN (SELECT {entity_id} FROM {relation_table}) AND name NOT IN ({placeholders})", canonical)
+            allowed = allowed_values(entity_table)
+            if allowed is not None:
+                placeholders = ",".join("?" for _ in allowed)
+                db.execute(f"DELETE FROM {relation_table} WHERE {entity_id} IN (SELECT id FROM {entity_table} WHERE name NOT IN ({placeholders}))", tuple(allowed))
+                db.execute(f"DELETE FROM {entity_table} WHERE name NOT IN ({placeholders})", tuple(allowed))
         if db.execute("SELECT 1 FROM app_meta WHERE key = 'csv_seeded'").fetchone():
             return
         csv_file = APP_DIR / "7inches-DJ.csv"
@@ -104,7 +196,10 @@ def initialise_database() -> None:
 
 def write_relation(db: sqlite3.Connection, table: str, entity_table: str, track_id: str, values: list[str]) -> None:
     db.execute(f"DELETE FROM {table} WHERE track_id = ?", (track_id,))
+    allowed = allowed_values(entity_table)
     for position, name in enumerate(values):
+        if allowed is not None and name not in allowed:
+            continue
         db.execute(f"INSERT OR IGNORE INTO {entity_table}(name) VALUES (?)", (name,))
         entity_id = db.execute(f"SELECT id FROM {entity_table} WHERE name = ?", (name,)).fetchone()["id"]
         db.execute(f"INSERT INTO {table}(track_id, {entity_table[:-1]}_id, position) VALUES (?, ?, ?)", (track_id, entity_id, position))
@@ -120,6 +215,8 @@ def write_track(db: sqlite3.Connection, track: dict, now: int) -> None:
     write_relation(db, "track_genres", "genres", track_id, split_values(track.get("Genres")))
     write_relation(db, "track_styles", "styles", track_id, split_values(track.get("Subgenre / Style")))
     write_relation(db, "track_tags", "tags", track_id, split_values(track.get("Tags")))
+    for label, relation_table, entity_table in [("Mood", "track_moods", "moods"), ("Groove", "track_grooves", "grooves"), ("Vocals", "track_vocals", "vocals"), ("Set Role", "track_set_roles", "set_roles"), ("Intro", "track_intros", "intros"), ("Outro", "track_outros", "outros")]:
+        write_relation(db, relation_table, entity_table, track_id, split_enum_values(track.get(label), entity_table))
 
 
 def relation_values(db: sqlite3.Connection, table: str, entity: str, track_id: str) -> str:
@@ -137,6 +234,8 @@ def database_state(db: sqlite3.Connection) -> dict:
         track["Genres"] = relation_values(db, "track_genres", "genres", row["id"])
         track["Subgenre / Style"] = relation_values(db, "track_styles", "styles", row["id"])
         track["Tags"] = relation_values(db, "track_tags", "tags", row["id"])
+        for label, relation_table, entity_table in [("Mood", "track_moods", "moods"), ("Groove", "track_grooves", "grooves"), ("Vocals", "track_vocals", "vocals"), ("Set Role", "track_set_roles", "set_roles"), ("Intro", "track_intros", "intros"), ("Outro", "track_outros", "outros")]:
+            track[label] = relation_values(db, relation_table, entity_table, row["id"])
         tracks.append(track)
     crates = []
     for crate in db.execute("SELECT * FROM crates ORDER BY created_at"):
@@ -154,7 +253,11 @@ def database_state(db: sqlite3.Connection) -> dict:
         else:
             finished_sets.append(payload)
     settings = {row["key"]: row["value"] for row in db.execute("SELECT key, value FROM app_settings")}
-    return {"tracks": tracks, "crates": crates, "sets": finished_sets, "activeSet": active_set, "currentId": settings.get("current_id"), "history": json.loads(settings.get("history", "[]")), "has_state": settings.get("state_saved") == "1"}
+    try:
+        matching_settings = json.loads(settings.get("matching_settings", "{}"))
+    except json.JSONDecodeError:
+        matching_settings = {}
+    return {"tracks": tracks, "crates": crates, "sets": finished_sets, "activeSet": active_set, "currentId": settings.get("current_id"), "history": json.loads(settings.get("history", "[]")), "matchingSettings": matching_settings, "has_state": settings.get("state_saved") == "1"}
 
 
 def recompute_stats(db: sqlite3.Connection, now: int) -> None:
@@ -208,7 +311,7 @@ def save_state(state: dict) -> None:
                     if track_id in incoming_tracks:
                         db.execute("INSERT INTO set_plays(set_id, track_id, position, played_at) VALUES (?, ?, ?, ?)", (set_id, track_id, position, item.get("startedAt", now)))
             recompute_stats(db, now)
-            settings = {"current_id": state.get("currentId") or "", "history": json.dumps(state.get("history", [])), "state_saved": "1"}
+            settings = {"current_id": state.get("currentId") or "", "history": json.dumps(state.get("history", [])), "matching_settings": json.dumps(state.get("matchingSettings", {})), "state_saved": "1"}
             for key, value in settings.items():
                 db.execute("INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, now))
 

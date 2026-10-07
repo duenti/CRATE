@@ -1,31 +1,27 @@
 # CRATE data contract
 
-`Genres`, `Subgenre / Style`, `Mood`, `Groove`, `Vocals`, `Set Role`, `Intro` and `Outro` may contain multiple values separated by a semicolon (`;`). Each value is trimmed independently; blanks are ignored.
+## Core model
 
-For the database implementation, model both fields as many-to-many relationships rather than as a single text value:
+CRATE models the physical collection before it models DJ choices:
 
-- `track_genres(track_id, genre_id)`
-- `track_styles(track_id, style_id)`
-- `track_moods(track_id, mood_id)`
-- `track_grooves(track_id, groove_id)`
-- `track_vocals(track_id, vocal_id)`
-- `track_set_roles(track_id, set_role_id)`
-- `track_intros(track_id, intro_id)`
-- `track_outros(track_id, outro_id)`
+- A `record` is one owned physical Discogs collection instance. Its stable remote identity is `discogs_instance_id`; two copies of the same Discogs release remain distinct records.
+- A `record` belongs to a Discogs `release` (`discogs_release_id`) and can have a master release, formats, labels, artists, genres and styles.
+- A `track` belongs to exactly one record. Its Discogs position is text, not a number, so positions such as `A`, `A1`, `B2`, `AA1` and `2-1` remain intact.
+- A crate is a selected list of tracks. A set is a performance history containing tracks from a crate or the wider collection.
 
-These multi-value fields are not stored as delimited text columns in `tracks`; the join tables are the source of truth. Legacy slash-delimited values are normalized during database initialization (while `/` remains part of valid enum names such as `Offbeat / Skank`).
-
-The supplied `genres.json` (15 values) and `styles.json` (757 values) are the authoritative enum sources. The local SQLite database seeds `genres` and `styles` from those files. The fixed enum lists for Mood, Groove, Vocals, Set Role, Intro and Outro are seeded into their own lookup tables when the database is initialized.
+Discogs release data and user-owned collection data are separate. The database therefore stores both the owned-instance ID and the release ID. The Personal Access Token will be stored locally in `app_settings` through Settings in step 2.
 
 ## Local database
 
-CRATE stores its local state in `app/data/crate.db`. The main tables are:
+`app/data/crate.db` contains:
 
-- `tracks`: the record, DJ fields and Spotify audio-feature columns.
-- `genres`, `styles`, `tags`, `moods`, `grooves`, `vocals`, `set_roles`, `intros`, `outros` plus their `track_*` join tables: controlled and free multi-value metadata.
-- `crates`, `crate_tracks`: saved selections.
-- `sets`, `set_plays`: active or completed sessions and the actual order of tracks played.
-- `set_track_stats`, `track_stats`: statistics derived from play history, per set and globally.
-- `app_settings`: current track and local UI state.
+- `records`, `record_formats`, `artists`, `record_artists`, `labels`, `record_labels`, `record_genres`, `record_styles`: imported collection and release metadata.
+- `tracks`, `track_artists`: release-specific tracklists and per-track DJ data.
+- `genres`, `styles`, `tags`, `moods`, `grooves`, `vocals`, `set_roles`, `intros`, `outros`, plus `track_*` tables: controlled metadata and DJ annotations.
+- `crates`, `crate_tracks`, `sets`, `set_plays`, `set_track_stats`, `track_stats`: selections and performance history.
+- `discogs_sync_state`: username, progress marker and most recent sync error. It deliberately does not store the token.
+- `app_settings`: local application preferences and, in step 2, the locally stored token.
 
-An active set is a row in `sets` with `status = 'active'`; ending it changes the status to `finished`. `set_plays` is the source of truth for a track played in a set.
+## Schema migration policy
+
+Schema version 2 is an intentional clean break from the CSV model. On the first launch of this branch it preserves `app_settings` and removes legacy tracks, crates, sets, statistics and CSV metadata. The pre-migration database backup is the recovery point.

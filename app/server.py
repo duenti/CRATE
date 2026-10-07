@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "crate.db"
 WRITE_LOCK = threading.Lock()
+DISCOGS_SYNC_LOCK = threading.Lock()
+DISCOGS_API_ROOT = "https://api.discogs.com"
+DISCOGS_USER_AGENT = "CRATE/0.2 (local Discogs collection manager)"
 
 TRACK_FIELDS = {
     "Track Number": "track_number", "Track Name": "track_name", "Artist Name(s)": "artist_names",
@@ -31,19 +36,55 @@ TRACK_FIELDS = {
 }
 REVERSE_TRACK_FIELDS = {value: key for key, value in TRACK_FIELDS.items()}
 
+SCHEMA_VERSION = "2"
+
+# `records` represents an owned physical item (a Discogs collection instance),
+# while `tracks` is the release-specific track list used in crates and sets.
 SCHEMA = """
-PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS tracks (
-  id TEXT PRIMARY KEY, track_number TEXT, track_name TEXT NOT NULL, artist_names TEXT, year INTEGER,
-  popularity REAL, danceability REAL, spotify_energy REAL, spotify_key INTEGER, loudness REAL,
-  spotify_mode INTEGER, speechiness REAL, acousticness REAL, instrumentalness REAL, liveness REAL,
-  valence REAL, tempo REAL, time_signature INTEGER, side TEXT, dj_energy INTEGER, funkiness INTEGER,
-  heaviness INTEGER, psychedelia INTEGER, vocal_intensity INTEGER, mixability INTEGER, dj_rating INTEGER, dj_notes TEXT,
-  goes_well_into TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS records (
+  id TEXT PRIMARY KEY, discogs_instance_id INTEGER NOT NULL UNIQUE, discogs_release_id INTEGER NOT NULL,
+  discogs_master_id INTEGER, title TEXT NOT NULL, year INTEGER, country TEXT, resource_url TEXT,
+  discogs_uri TEXT, cover_image_url TEXT, thumb_image_url TEXT, folder_id INTEGER, folder_name TEXT,
+  rating INTEGER CHECK(rating BETWEEN 0 AND 5), media_condition TEXT, sleeve_condition TEXT,
+  collection_notes TEXT, added_at INTEGER, is_in_collection INTEGER NOT NULL DEFAULT 1 CHECK(is_in_collection IN (0, 1)),
+  last_synced_at INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS record_formats (
+  id INTEGER PRIMARY KEY, record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL, name TEXT NOT NULL, quantity INTEGER, text TEXT,
+  descriptions_json TEXT NOT NULL DEFAULT '[]', UNIQUE(record_id, position)
+);
+CREATE TABLE IF NOT EXISTS artists (id INTEGER PRIMARY KEY, discogs_artist_id INTEGER UNIQUE, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS record_artists (
+  record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE, artist_id INTEGER NOT NULL REFERENCES artists(id) ON DELETE RESTRICT,
+  position INTEGER NOT NULL, name_variation TEXT, join_phrase TEXT, PRIMARY KEY(record_id, artist_id, position)
+);
+CREATE TABLE IF NOT EXISTS labels (id INTEGER PRIMARY KEY, discogs_label_id INTEGER UNIQUE, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS record_labels (
+  record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE, label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE RESTRICT,
+  catalog_number TEXT, position INTEGER NOT NULL, PRIMARY KEY(record_id, label_id, position)
 );
 CREATE TABLE IF NOT EXISTS genres (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, color TEXT);
 CREATE TABLE IF NOT EXISTS styles (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS record_genres (record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE, genre_id INTEGER NOT NULL REFERENCES genres(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(record_id, genre_id));
+CREATE TABLE IF NOT EXISTS record_styles (record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE, style_id INTEGER NOT NULL REFERENCES styles(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(record_id, style_id));
+CREATE TABLE IF NOT EXISTS tracks (
+  id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  discogs_position TEXT NOT NULL, position_index INTEGER NOT NULL, title TEXT NOT NULL,
+  duration_text TEXT, duration_seconds INTEGER, track_type TEXT NOT NULL DEFAULT 'track',
+  is_audio INTEGER NOT NULL DEFAULT 1 CHECK(is_audio IN (0, 1)),
+  popularity REAL, danceability REAL, spotify_energy REAL, spotify_key INTEGER, loudness REAL,
+  spotify_mode INTEGER, speechiness REAL, acousticness REAL, instrumentalness REAL, liveness REAL,
+  valence REAL, tempo REAL, time_signature INTEGER, dj_energy INTEGER, funkiness INTEGER,
+  heaviness INTEGER, psychedelia INTEGER, vocal_intensity INTEGER, mixability INTEGER, dj_rating INTEGER,
+  dj_notes TEXT, goes_well_into TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  UNIQUE(record_id, discogs_position)
+);
+CREATE TABLE IF NOT EXISTS track_artists (
+  track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, artist_id INTEGER NOT NULL REFERENCES artists(id) ON DELETE RESTRICT,
+  position INTEGER NOT NULL, name_variation TEXT, join_phrase TEXT, PRIMARY KEY(track_id, artist_id, position)
+);
 CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS track_genres (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, genre_id INTEGER NOT NULL REFERENCES genres(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, genre_id));
 CREATE TABLE IF NOT EXISTS track_styles (track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, style_id INTEGER NOT NULL REFERENCES styles(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(track_id, style_id));
@@ -66,9 +107,14 @@ CREATE TABLE IF NOT EXISTS sets (id TEXT PRIMARY KEY, crate_id TEXT REFERENCES c
 CREATE TABLE IF NOT EXISTS set_plays (id INTEGER PRIMARY KEY, set_id TEXT NOT NULL REFERENCES sets(id) ON DELETE CASCADE, track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT, position INTEGER NOT NULL, played_at INTEGER, UNIQUE(set_id, position));
 CREATE TABLE IF NOT EXISTS set_track_stats (set_id TEXT NOT NULL REFERENCES sets(id) ON DELETE CASCADE, track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, play_count INTEGER NOT NULL DEFAULT 0, first_position INTEGER, last_position INTEGER, PRIMARY KEY(set_id, track_id));
 CREATE TABLE IF NOT EXISTS track_stats (track_id TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE, total_plays INTEGER NOT NULL DEFAULT 0, total_sets INTEGER NOT NULL DEFAULT 0, last_played_at INTEGER, updated_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS discogs_sync_state (
+  id INTEGER PRIMARY KEY CHECK(id = 1), username TEXT, last_started_at INTEGER, last_completed_at INTEGER,
+  last_error TEXT, continuation_page INTEGER, updated_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_set_plays_track ON set_plays(track_id);
 CREATE INDEX IF NOT EXISTS idx_crate_tracks_track ON crate_tracks(track_id);
+CREATE INDEX IF NOT EXISTS idx_tracks_record_position ON tracks(record_id, position_index);
+CREATE INDEX IF NOT EXISTS idx_records_release ON records(discogs_release_id);
 """
 
 GENRE_COLORS = {"Blues":"#427BB8","Brass & Military":"#89965B","Children's":"#F4D35E","Classical":"#E5DCC5","Electronic":"#35C9D0","Folk, World, & Country":"#C88765","Funk / Soul":"#E99A35","Hip-Hop":"#9467D8","Jazz":"#459A92","Latin":"#F07868","Non-Music":"#929AA6","Pop":"#EC79B5","Reggae":"#68B866","Rock":"#D95757","Stage & Screen":"#BCA164"}
@@ -139,59 +185,59 @@ def value_or_none(value: object) -> object:
 
 def initialise_database() -> None:
     with connect() as db:
+        # The v2 migration deliberately retains only app settings. The user has
+        # backed up the old database and explicitly chose a clean Discogs import.
+        db.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+        version = db.execute("SELECT value FROM app_settings WHERE key = 'schema_version'").fetchone()
+        if version is None or version["value"] != SCHEMA_VERSION:
+            db.executescript("""
+                DROP TABLE IF EXISTS set_track_stats;
+                DROP TABLE IF EXISTS track_stats;
+                DROP TABLE IF EXISTS set_plays;
+                DROP TABLE IF EXISTS crate_tracks;
+                DROP TABLE IF EXISTS sets;
+                DROP TABLE IF EXISTS crates;
+                DROP TABLE IF EXISTS track_genres;
+                DROP TABLE IF EXISTS track_styles;
+                DROP TABLE IF EXISTS track_tags;
+                DROP TABLE IF EXISTS track_moods;
+                DROP TABLE IF EXISTS track_grooves;
+                DROP TABLE IF EXISTS track_vocals;
+                DROP TABLE IF EXISTS track_set_roles;
+                DROP TABLE IF EXISTS track_intros;
+                DROP TABLE IF EXISTS track_outros;
+                DROP TABLE IF EXISTS track_artists;
+                DROP TABLE IF EXISTS tracks;
+                DROP TABLE IF EXISTS record_genres;
+                DROP TABLE IF EXISTS record_styles;
+                DROP TABLE IF EXISTS record_artists;
+                DROP TABLE IF EXISTS record_labels;
+                DROP TABLE IF EXISTS record_formats;
+                DROP TABLE IF EXISTS records;
+                DROP TABLE IF EXISTS artists;
+                DROP TABLE IF EXISTS labels;
+                DROP TABLE IF EXISTS genres;
+                DROP TABLE IF EXISTS styles;
+                DROP TABLE IF EXISTS tags;
+                DROP TABLE IF EXISTS moods;
+                DROP TABLE IF EXISTS grooves;
+                DROP TABLE IF EXISTS vocals;
+                DROP TABLE IF EXISTS set_roles;
+                DROP TABLE IF EXISTS intros;
+                DROP TABLE IF EXISTS outros;
+                DROP TABLE IF EXISTS discogs_sync_state;
+                DROP TABLE IF EXISTS app_meta;
+            """)
         db.executescript(SCHEMA)
-        for name, color in GENRE_COLORS.items():
-            db.execute("INSERT OR IGNORE INTO genres(name, color) VALUES (?, ?)", (name, color))
-        styles_file = APP_DIR / "styles.json"
-        if styles_file.exists():
-            for name in json.loads(styles_file.read_text(encoding="utf-8")):
-                db.execute("INSERT OR IGNORE INTO styles(name) VALUES (?)", (name,))
         for table, values in ENUM_VALUES.items():
             for name in values:
                 db.execute(f"INSERT OR IGNORE INTO {table}(name) VALUES (?)", (name,))
-        # Migrate values from the original scalar columns into the normalized
-        # N–M tables. The scalar columns remain for backward compatibility.
-        relation_specs = [("Groove", "groove", "track_grooves", "grooves"), ("Mood", "mood", "track_moods", "moods"), ("Vocals", "vocals", "track_vocals", "vocals"), ("Set Role", "set_role", "track_set_roles", "set_roles"), ("Intro", "intro", "track_intros", "intros"), ("Outro", "outro", "track_outros", "outros")]
-        track_columns = {row["name"] for row in db.execute("PRAGMA table_info(tracks)")}
-        legacy_columns = [column for _, column, _, _ in relation_specs if column in track_columns]
-        select_columns = ", ".join(["id", *legacy_columns])
-        for row in db.execute(f"SELECT {select_columns} FROM tracks"):
-            for label, column, relation_table, entity_table in relation_specs:
-                if column not in track_columns:
-                    continue
-                if not db.execute(f"SELECT 1 FROM {relation_table} WHERE track_id = ? LIMIT 1", (row["id"],)).fetchone():
-                    write_relation(db, relation_table, entity_table, row["id"], split_enum_values(row[column], entity_table))
-        for column in legacy_columns:
-            db.execute(f"ALTER TABLE tracks DROP COLUMN {column}")
-        # Normalize legacy slash-delimited relation values such as
-        # "Four-on-the-floor / syncopated" into two enum rows.
-        for _, _, relation_table, entity_table in relation_specs:
-            entity_id = f"{entity_table[:-1]}_id"
-            for track in db.execute(f"SELECT DISTINCT track_id FROM {relation_table}"):
-                names = [item["name"] for item in db.execute(f"SELECT e.name FROM {relation_table} r JOIN {entity_table} e ON e.id = r.{entity_id} WHERE r.track_id = ? ORDER BY r.position", (track["track_id"],))]
-                normalized = split_enum_values("; ".join(names), entity_table)
-                if normalized != names:
-                    write_relation(db, relation_table, entity_table, track["track_id"], normalized)
-            canonical = ENUM_VALUES.get(entity_table, [])
-            placeholders = ",".join("?" for _ in canonical)
-            if canonical:
-                db.execute(f"DELETE FROM {entity_table} WHERE id NOT IN (SELECT {entity_id} FROM {relation_table}) AND name NOT IN ({placeholders})", canonical)
-            allowed = allowed_values(entity_table)
-            if allowed is not None:
-                placeholders = ",".join("?" for _ in allowed)
-                db.execute(f"DELETE FROM {relation_table} WHERE {entity_id} IN (SELECT id FROM {entity_table} WHERE name NOT IN ({placeholders}))", tuple(allowed))
-                db.execute(f"DELETE FROM {entity_table} WHERE name NOT IN ({placeholders})", tuple(allowed))
-        if db.execute("SELECT 1 FROM app_meta WHERE key = 'csv_seeded'").fetchone():
-            return
-        csv_file = APP_DIR / "7inches-DJ.csv"
-        if csv_file.exists():
-            now = int(time.time() * 1000)
-            with csv_file.open(encoding="utf-8-sig", newline="") as source:
-                for index, row in enumerate(csv.DictReader(source), start=1):
-                    track = dict(row)
-                    track["_id"] = f"seed-{index}"
-                    write_track(db, track, now)
-        db.execute("INSERT INTO app_meta(key, value) VALUES ('csv_seeded', ?)", (str(int(time.time())),))
+        now = int(time.time() * 1000)
+        db.execute(
+            "INSERT INTO app_settings(key, value, updated_at) VALUES ('schema_version', ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (SCHEMA_VERSION, now),
+        )
 
 
 def write_relation(db: sqlite3.Connection, table: str, entity_table: str, track_id: str, values: list[str]) -> None:
@@ -225,39 +271,280 @@ def relation_values(db: sqlite3.Connection, table: str, entity: str, track_id: s
 
 
 def database_state(db: sqlite3.Connection) -> dict:
-    tracks = []
-    for row in db.execute("SELECT * FROM tracks ORDER BY CAST(track_number AS INTEGER), track_name"):
-        track = {"_id": row["id"]}
-        for column, label in REVERSE_TRACK_FIELDS.items():
-            value = row[column]
-            track[label] = "" if value is None else str(value)
-        track["Genres"] = relation_values(db, "track_genres", "genres", row["id"])
-        track["Subgenre / Style"] = relation_values(db, "track_styles", "styles", row["id"])
-        track["Tags"] = relation_values(db, "track_tags", "tags", row["id"])
-        for label, relation_table, entity_table in [("Mood", "track_moods", "moods"), ("Groove", "track_grooves", "grooves"), ("Vocals", "track_vocals", "vocals"), ("Set Role", "track_set_roles", "set_roles"), ("Intro", "track_intros", "intros"), ("Outro", "track_outros", "outros")]:
-            track[label] = relation_values(db, relation_table, entity_table, row["id"])
-        tracks.append(track)
-    crates = []
-    for crate in db.execute("SELECT * FROM crates ORDER BY created_at"):
-        track_ids = [row["track_id"] for row in db.execute("SELECT track_id FROM crate_tracks WHERE crate_id = ? ORDER BY position", (crate["id"],))]
-        crates.append({"id": crate["id"], "name": crate["name"], "defaultTonight": bool(crate["default_tonight"]), "trackIds": track_ids})
-    finished_sets, active_set = [], None
-    for item in db.execute("SELECT * FROM sets ORDER BY started_at DESC"):
-        track_ids = [row["track_id"] for row in db.execute("SELECT track_id FROM set_plays WHERE set_id = ? ORDER BY position", (item["id"],))]
-        payload = {"id": item["id"], "crateId": item["crate_id"], "name": item["name"], "startedAt": item["started_at"], "trackIds": track_ids}
-        if item["ended_at"] is not None:
-            payload["endedAt"] = item["ended_at"]
-        if item["status"] == "active":
-            payload["explicit"] = True
-            active_set = payload
-        else:
-            finished_sets.append(payload)
-    settings = {row["key"]: row["value"] for row in db.execute("SELECT key, value FROM app_settings")}
+    settings = {row["key"]: row["value"] for row in db.execute("SELECT key, value FROM app_settings WHERE key != 'discogs_token'")}
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "records": [],
+        "tracks": [],
+        "settings": settings,
+        # Compatibility placeholders until the browser UI is updated in step 3.
+        "crates": [], "sets": [], "activeSet": None, "currentId": None,
+        "history": [], "matchingSettings": {}, "has_state": True,
+        "discogsTokenConfigured": bool(db.execute("SELECT 1 FROM app_settings WHERE key = 'discogs_token' AND value != ''").fetchone()),
+    }
+
+
+class DiscogsAPIError(RuntimeError):
+    """A safe, user-facing failure returned by the Discogs API."""
+
+
+class DiscogsClient:
+    """Small dependency-free Discogs client with conservative rate limiting."""
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self.last_request_at = 0.0
+
+    def get(self, path: str, **params: object) -> dict:
+        query = urlencode({key: value for key, value in params.items() if value is not None})
+        url = f"{DISCOGS_API_ROOT}{path}" + (f"?{query}" if query else "")
+        for attempt in range(3):
+            elapsed = time.monotonic() - self.last_request_at
+            if elapsed < 1.05:
+                time.sleep(1.05 - elapsed)
+            request = Request(url, headers={
+                "Authorization": f"Discogs token={self.token}",
+                "User-Agent": DISCOGS_USER_AGENT,
+                "Accept": "application/vnd.discogs.v2.discogs+json",
+            })
+            try:
+                with urlopen(request, timeout=30) as response:
+                    self.last_request_at = time.monotonic()
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as error:
+                self.last_request_at = time.monotonic()
+                if error.code == HTTPStatus.TOO_MANY_REQUESTS and attempt < 2:
+                    retry_after = error.headers.get("Retry-After", "60")
+                    try:
+                        time.sleep(max(1, min(int(retry_after), 120)))
+                    except ValueError:
+                        time.sleep(60)
+                    continue
+                if error.code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+                    raise DiscogsAPIError("Discogs rejected this token. Check it in Settings.") from error
+                raise DiscogsAPIError(f"Discogs returned HTTP {error.code}.") from error
+            except (URLError, TimeoutError, json.JSONDecodeError) as error:
+                raise DiscogsAPIError("Could not reach Discogs. Check your connection and try again.") from error
+        raise DiscogsAPIError("Discogs rate limit was reached. Try again shortly.")
+
+
+def discogs_token() -> str:
+    with connect() as db:
+        row = db.execute("SELECT value FROM app_settings WHERE key = 'discogs_token'").fetchone()
+    if not row or not row["value"].strip():
+        raise DiscogsAPIError("Add your Discogs Personal Access Token in Settings first.")
+    return row["value"].strip()
+
+
+def parse_discogs_date(value: object) -> int | None:
+    if not isinstance(value, str) or not value:
+        return None
     try:
-        matching_settings = json.loads(settings.get("matching_settings", "{}"))
-    except json.JSONDecodeError:
-        matching_settings = {}
-    return {"tracks": tracks, "crates": crates, "sets": finished_sets, "activeSet": active_set, "currentId": settings.get("current_id"), "history": json.loads(settings.get("history", "[]")), "matchingSettings": matching_settings, "has_state": settings.get("state_saved") == "1"}
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def duration_seconds(value: object) -> int | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parts = [int(part) for part in value.split(":")]
+    except ValueError:
+        return None
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return None
+
+
+def is_dj_vinyl(release: dict) -> bool:
+    """Keep vinyl records explicitly described by Discogs as 7-inch or 12-inch."""
+    for format_data in release.get("formats", []):
+        if str(format_data.get("name", "")).casefold() != "vinyl":
+            continue
+        details = [str(format_data.get("text", "")), *map(str, format_data.get("descriptions", []))]
+        if any(size in detail for detail in details for size in ('7"', '12"')):
+            return True
+    return False
+
+
+def upsert_artist(db: sqlite3.Connection, artist: dict) -> int:
+    discogs_id = artist.get("id")
+    name = str(artist.get("name") or "Unknown artist")
+    if isinstance(discogs_id, int):
+        db.execute("INSERT INTO artists(discogs_artist_id, name) VALUES (?, ?) ON CONFLICT(discogs_artist_id) DO UPDATE SET name=excluded.name", (discogs_id, name))
+        return db.execute("SELECT id FROM artists WHERE discogs_artist_id = ?", (discogs_id,)).fetchone()["id"]
+    db.execute("INSERT OR IGNORE INTO artists(name) VALUES (?)", (name,))
+    return db.execute("SELECT id FROM artists WHERE name = ?", (name,)).fetchone()["id"]
+
+
+def replace_artists(db: sqlite3.Connection, table: str, owner_column: str, owner_id: str, artists: list[dict]) -> None:
+    db.execute(f"DELETE FROM {table} WHERE {owner_column} = ?", (owner_id,))
+    for position, artist in enumerate(artists):
+        artist_id = upsert_artist(db, artist)
+        db.execute(
+            f"INSERT INTO {table}({owner_column}, artist_id, position, name_variation, join_phrase) VALUES (?, ?, ?, ?, ?)",
+            (owner_id, artist_id, position, artist.get("anv"), artist.get("join")),
+        )
+
+
+def replace_record_names(db: sqlite3.Connection, relation_table: str, entity_table: str, record_id: str, names: list[object]) -> None:
+    entity_id = f"{entity_table[:-1]}_id"
+    db.execute(f"DELETE FROM {relation_table} WHERE record_id = ?", (record_id,))
+    for position, name in enumerate(dict.fromkeys(str(name).strip() for name in names if str(name).strip())):
+        db.execute(f"INSERT OR IGNORE INTO {entity_table}(name) VALUES (?)", (name,))
+        row = db.execute(f"SELECT id FROM {entity_table} WHERE name = ?", (name,)).fetchone()
+        db.execute(f"INSERT INTO {relation_table}(record_id, {entity_id}, position) VALUES (?, ?, ?)", (record_id, row["id"], position))
+
+
+def import_discogs_record(db: sqlite3.Connection, collection_item: dict, release: dict, synced_at: int) -> int:
+    basic = collection_item.get("basic_information") or {}
+    instance_id = collection_item.get("instance_id")
+    release_id = release.get("id") or basic.get("id")
+    if not isinstance(instance_id, int) or not isinstance(release_id, int):
+        raise DiscogsAPIError("Discogs returned a collection item without a release identity.")
+    record_id = f"discogs-instance-{instance_id}"
+    now = int(time.time() * 1000)
+    images = release.get("images") or basic.get("images") or []
+    primary_image = next((image for image in images if image.get("type") == "primary"), images[0] if images else {})
+    db.execute(
+        """INSERT INTO records(id, discogs_instance_id, discogs_release_id, discogs_master_id, title, year, country, resource_url, discogs_uri, cover_image_url, thumb_image_url, folder_id, folder_name, rating, media_condition, sleeve_condition, collection_notes, added_at, is_in_collection, last_synced_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET discogs_release_id=excluded.discogs_release_id, discogs_master_id=excluded.discogs_master_id, title=excluded.title, year=excluded.year, country=excluded.country, resource_url=excluded.resource_url, discogs_uri=excluded.discogs_uri, cover_image_url=excluded.cover_image_url, thumb_image_url=excluded.thumb_image_url, folder_id=excluded.folder_id, rating=excluded.rating, collection_notes=excluded.collection_notes, added_at=excluded.added_at, is_in_collection=1, last_synced_at=excluded.last_synced_at, updated_at=excluded.updated_at""",
+        (record_id, instance_id, release_id, release.get("master_id") or basic.get("master_id"), release.get("title") or basic.get("title") or "Untitled", release.get("year") or basic.get("year"), release.get("country"), release.get("resource_url") or basic.get("resource_url"), release.get("uri") or basic.get("uri"), primary_image.get("uri"), primary_image.get("uri150") or basic.get("thumb"), collection_item.get("folder_id"), None, collection_item.get("rating"), collection_item.get("media_condition"), collection_item.get("sleeve_condition"), collection_item.get("notes"), parse_discogs_date(collection_item.get("date_added")), synced_at, now, now),
+    )
+    db.execute("DELETE FROM record_formats WHERE record_id = ?", (record_id,))
+    for position, format_data in enumerate(release.get("formats") or basic.get("formats") or []):
+        db.execute("INSERT INTO record_formats(record_id, position, name, quantity, text, descriptions_json) VALUES (?, ?, ?, ?, ?, ?)", (record_id, position, format_data.get("name", "Unknown"), format_data.get("qty"), format_data.get("text"), json.dumps(format_data.get("descriptions", []))))
+    replace_artists(db, "record_artists", "record_id", record_id, release.get("artists") or basic.get("artists") or [])
+    db.execute("DELETE FROM record_labels WHERE record_id = ?", (record_id,))
+    for position, label in enumerate(release.get("labels") or basic.get("labels") or []):
+        label_id = label.get("id")
+        name = str(label.get("name") or "Unknown label")
+        if isinstance(label_id, int):
+            db.execute("INSERT INTO labels(discogs_label_id, name) VALUES (?, ?) ON CONFLICT(discogs_label_id) DO UPDATE SET name=excluded.name", (label_id, name))
+            local_label_id = db.execute("SELECT id FROM labels WHERE discogs_label_id = ?", (label_id,)).fetchone()["id"]
+        else:
+            db.execute("INSERT OR IGNORE INTO labels(name) VALUES (?)", (name,))
+            local_label_id = db.execute("SELECT id FROM labels WHERE name = ?", (name,)).fetchone()["id"]
+        db.execute("INSERT INTO record_labels(record_id, label_id, catalog_number, position) VALUES (?, ?, ?, ?)", (record_id, local_label_id, label.get("catno"), position))
+    replace_record_names(db, "record_genres", "genres", record_id, release.get("genres") or basic.get("genres") or [])
+    replace_record_names(db, "record_styles", "styles", record_id, release.get("styles") or basic.get("styles") or [])
+    imported_tracks = 0
+    for source_index, track in enumerate(release.get("tracklist") or []):
+        if track.get("type_", "track") != "track":
+            continue
+        imported_tracks += 1
+        track_id = f"{record_id}:track-{source_index}"
+        position = str(track.get("position") or source_index + 1)
+        db.execute(
+            """INSERT INTO tracks(id, record_id, discogs_position, position_index, title, duration_text, duration_seconds, track_type, is_audio, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET discogs_position=excluded.discogs_position, position_index=excluded.position_index, title=excluded.title, duration_text=excluded.duration_text, duration_seconds=excluded.duration_seconds, track_type=excluded.track_type, updated_at=excluded.updated_at""",
+            (track_id, record_id, position, source_index, track.get("title") or "Untitled", track.get("duration"), duration_seconds(track.get("duration")), track.get("type_", "track"), now, now),
+        )
+        replace_artists(db, "track_artists", "track_id", track_id, track.get("artists") or [])
+    return imported_tracks
+
+
+def update_sync_state(**values: object) -> None:
+    now = int(time.time() * 1000)
+    columns = {"updated_at": now, **values}
+    assignments = ", ".join(f"{name}=excluded.{name}" for name in columns if name != "id")
+    with WRITE_LOCK, connect() as db:
+        db.execute(f"INSERT INTO discogs_sync_state(id, {', '.join(columns)}) VALUES (1, {', '.join('?' for _ in columns)}) ON CONFLICT(id) DO UPDATE SET {assignments}", tuple(columns.values()))
+
+
+def discogs_status() -> dict:
+    with connect() as db:
+        state = db.execute("SELECT * FROM discogs_sync_state WHERE id = 1").fetchone()
+        count = db.execute("SELECT COUNT(*) AS count FROM records WHERE is_in_collection = 1").fetchone()["count"]
+        configured = bool(db.execute("SELECT 1 FROM app_settings WHERE key = 'discogs_token' AND value != ''").fetchone())
+    return {"tokenConfigured": configured, "recordCount": count, "sync": dict(state) if state else None}
+
+
+def fetch_discogs_collection(api: DiscogsClient, username: str) -> list[dict]:
+    """Fetch lightweight collection entries; full release data waits for import."""
+    collection_items: list[dict] = []
+    page = 1
+    while True:
+        response = api.get(
+            f"/users/{quote(username, safe='')}/collection/folders/0/releases",
+            page=page, per_page=100, sort="added", sort_order="desc",
+        )
+        # Show the complete owned collection in the picker. Discogs often marks
+        # a 12-inch as "LP" rather than `12\"`, so filtering here hid valid
+        # records before the user ever had a chance to choose them.
+        collection_items.extend(item for item in response.get("releases", []))
+        pages = int((response.get("pagination") or {}).get("pages") or 1)
+        if page >= pages:
+            break
+        page += 1
+    return collection_items
+
+
+def collection_preview() -> dict:
+    api = DiscogsClient(discogs_token())
+    identity = api.get("/oauth/identity")
+    username = identity.get("username")
+    if not isinstance(username, str) or not username:
+        raise DiscogsAPIError("Discogs did not return an account name for this token.")
+    records = []
+    for item in fetch_discogs_collection(api, username):
+        basic = item.get("basic_information") or {}
+        instance_id = item.get("instance_id")
+        release_id = basic.get("id")
+        if not isinstance(instance_id, int) or not isinstance(release_id, int):
+            continue
+        artists = ", ".join(str(artist.get("name", "")) for artist in basic.get("artists", []) if artist.get("name"))
+        formats = [format_data for format_data in basic.get("formats", []) if str(format_data.get("name", "")).casefold() == "vinyl"]
+        records.append({
+            "instanceId": instance_id, "releaseId": release_id, "title": basic.get("title") or "Untitled",
+            "artists": artists, "year": basic.get("year"), "thumb": basic.get("thumb"),
+            "formats": formats,
+        })
+    return {"username": username, "records": records}
+
+
+def import_discogs_selection(instance_ids: set[int]) -> dict:
+    if not DISCOGS_SYNC_LOCK.acquire(blocking=False):
+        raise DiscogsAPIError("A Discogs sync is already in progress.")
+    try:
+        api = DiscogsClient(discogs_token())
+        identity = api.get("/oauth/identity")
+        username = identity.get("username")
+        if not isinstance(username, str) or not username:
+            raise DiscogsAPIError("Discogs did not return an account name for this token.")
+        sync_mark = int(time.time() * 1000)
+        update_sync_state(username=username, last_started_at=sync_mark, last_error=None, continuation_page=1)
+        collection_items = [item for item in fetch_discogs_collection(api, username) if item.get("instance_id") in instance_ids]
+        imported_records = imported_tracks = 0
+        for index, item in enumerate(collection_items, start=1):
+            release_id = (item.get("basic_information") or {}).get("id")
+            if not isinstance(release_id, int):
+                continue
+            release = api.get(f"/releases/{release_id}")
+            with WRITE_LOCK, connect() as db:
+                with db:
+                    imported_tracks += import_discogs_record(db, item, release, sync_mark)
+            imported_records += 1
+            update_sync_state(username=username, continuation_page=index)
+        completed_at = int(time.time() * 1000)
+        update_sync_state(username=username, last_completed_at=completed_at, last_error=None, continuation_page=None)
+        return {"username": username, "records": imported_records, "tracks": imported_tracks, "requested": len(instance_ids)}
+    except DiscogsAPIError as error:
+        update_sync_state(last_error=str(error))
+        raise
+    finally:
+        DISCOGS_SYNC_LOCK.release()
+
+
+def sync_discogs_collection() -> dict:
+    """Compatibility helper for a future non-interactive full sync."""
+    preview = collection_preview()
+    return import_discogs_selection({record["instanceId"] for record in preview["records"]})
 
 
 def recompute_stats(db: sqlite3.Connection, now: int) -> None:
@@ -329,27 +616,84 @@ class CrateHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        if urlparse(self.path).path == "/api/state":
+        path = urlparse(self.path).path
+        if path == "/api/state":
             with connect() as db:
                 self.send_json(database_state(db))
             return
-        if urlparse(self.path).path == "/api/health":
+        if path == "/api/discogs/status":
+            self.send_json(discogs_status())
+            return
+        if path == "/api/discogs/collection-preview":
+            try:
+                self.send_json({"ok": True, **collection_preview()})
+            except DiscogsAPIError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_GATEWAY)
+            return
+        if path == "/api/health":
             self.send_json({"ok": True, "database": str(DB_PATH)})
             return
         super().do_GET()
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/api/state":
+        path = urlparse(self.path).path
+        if path == "/api/settings/discogs-token":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict) or not isinstance(payload.get("token", ""), str):
+                    raise ValueError("Token must be text.")
+                token = payload.get("token", "").strip()
+            except (json.JSONDecodeError, ValueError, TypeError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                return
+            with WRITE_LOCK, connect() as db:
+                if token:
+                    db.execute("INSERT INTO app_settings(key, value, updated_at) VALUES ('discogs_token', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (token, int(time.time() * 1000)))
+                else:
+                    db.execute("DELETE FROM app_settings WHERE key = 'discogs_token'")
+            self.send_json({"ok": True, "configured": bool(token)})
+            return
+        if path in {"/api/discogs/validate", "/api/discogs/sync"}:
+            try:
+                token = discogs_token()
+                api = DiscogsClient(token)
+                identity = api.get("/oauth/identity")
+                username = identity.get("username")
+                if not isinstance(username, str) or not username:
+                    raise DiscogsAPIError("Discogs did not return an account name for this token.")
+                if path == "/api/discogs/validate":
+                    self.send_json({"ok": True, "username": username})
+                    return
+                # Fetch identity again within the sync only when a sync is requested;
+                # validation remains a cheap, separate action for Settings.
+                result = sync_discogs_collection()
+                self.send_json({"ok": True, **result})
+            except DiscogsAPIError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_GATEWAY)
+            return
+        if path == "/api/discogs/import":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length))
+                selected = payload.get("instanceIds") if isinstance(payload, dict) else None
+                if not isinstance(selected, list) or not selected:
+                    raise ValueError("Select at least one record to import.")
+                instance_ids = {item for item in selected if isinstance(item, int)}
+                if len(instance_ids) != len(selected):
+                    raise ValueError("Invalid Discogs collection selection.")
+                self.send_json({"ok": True, **import_discogs_selection(instance_ids)})
+            except (json.JSONDecodeError, ValueError, TypeError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            except DiscogsAPIError as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_GATEWAY)
+            return
+        if path != "/api/state":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            state = json.loads(self.rfile.read(length))
-            save_state(state)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-            self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
-            return
-        self.send_json({"ok": True})
+        # The CSV state endpoint is intentionally disabled. Step 2 introduces
+        # explicit Discogs import endpoints; step 3 replaces this browser client.
+        self.send_json({"error": "The legacy CSV state API has been retired."}, HTTPStatus.GONE)
 
     def log_message(self, format: str, *args) -> None:
         print(f"[CRATE] {format % args}")

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -20,6 +21,8 @@ DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "crate.db"
 WRITE_LOCK = threading.Lock()
 DISCOGS_SYNC_LOCK = threading.Lock()
+IMPORT_PROGRESS_LOCK = threading.Lock()
+IMPORT_PROGRESS: dict[str, object] = {"state": "idle", "completed": 0, "total": 0, "error": None}
 DISCOGS_API_ROOT = "https://api.discogs.com"
 DISCOGS_USER_AGENT = "CRATE/0.2 (local Discogs collection manager)"
 
@@ -272,9 +275,17 @@ def relation_values(db: sqlite3.Connection, table: str, entity: str, track_id: s
 
 def database_state(db: sqlite3.Connection) -> dict:
     settings = {row["key"]: row["value"] for row in db.execute("SELECT key, value FROM app_settings WHERE key != 'discogs_token'")}
+    records = []
+    for row in db.execute("SELECT * FROM records WHERE is_in_collection = 1 ORDER BY added_at DESC, title"):
+        artists = [artist["name"] for artist in db.execute("SELECT a.name FROM record_artists ra JOIN artists a ON a.id = ra.artist_id WHERE ra.record_id = ? ORDER BY ra.position", (row["id"],))]
+        formats = [format_row["name"] + (f" · {format_row['text']}" if format_row["text"] else "") + (f" · {', '.join(json.loads(format_row['descriptions_json']))}" if format_row["descriptions_json"] else "") for format_row in db.execute("SELECT * FROM record_formats WHERE record_id = ? ORDER BY position", (row["id"],))]
+        genres = [item["name"] for item in db.execute("SELECT g.name FROM record_genres rg JOIN genres g ON g.id = rg.genre_id WHERE rg.record_id = ? ORDER BY rg.position", (row["id"],))]
+        styles = [item["name"] for item in db.execute("SELECT s.name FROM record_styles rs JOIN styles s ON s.id = rs.style_id WHERE rs.record_id = ? ORDER BY rs.position", (row["id"],))]
+        tracks = [{"position": track["discogs_position"], "title": track["title"], "duration": track["duration_text"]} for track in db.execute("SELECT discogs_position, title, duration_text FROM tracks WHERE record_id = ? ORDER BY position_index", (row["id"],))]
+        records.append({"id": row["id"], "title": row["title"], "artists": ", ".join(artists), "year": row["year"], "country": row["country"], "formats": formats, "genres": genres, "styles": styles, "tracks": tracks, "coverImage": row["cover_image_url"], "addedAt": row["added_at"]})
     return {
         "schemaVersion": SCHEMA_VERSION,
-        "records": [],
+        "records": records,
         "tracks": [],
         "settings": settings,
         # Compatibility placeholders until the browser UI is updated in step 3.
@@ -508,7 +519,7 @@ def collection_preview() -> dict:
     return {"username": username, "records": records}
 
 
-def import_discogs_selection(instance_ids: set[int]) -> dict:
+def import_discogs_selection(instance_ids: set[int], progress: Callable[[int, int], None] | None = None) -> dict:
     if not DISCOGS_SYNC_LOCK.acquire(blocking=False):
         raise DiscogsAPIError("A Discogs sync is already in progress.")
     try:
@@ -520,6 +531,8 @@ def import_discogs_selection(instance_ids: set[int]) -> dict:
         sync_mark = int(time.time() * 1000)
         update_sync_state(username=username, last_started_at=sync_mark, last_error=None, continuation_page=1)
         collection_items = [item for item in fetch_discogs_collection(api, username) if item.get("instance_id") in instance_ids]
+        if progress:
+            progress(0, len(collection_items))
         imported_records = imported_tracks = 0
         for index, item in enumerate(collection_items, start=1):
             release_id = (item.get("basic_information") or {}).get("id")
@@ -530,6 +543,8 @@ def import_discogs_selection(instance_ids: set[int]) -> dict:
                 with db:
                     imported_tracks += import_discogs_record(db, item, release, sync_mark)
             imported_records += 1
+            if progress:
+                progress(imported_records, len(collection_items))
             update_sync_state(username=username, continuation_page=index)
         completed_at = int(time.time() * 1000)
         update_sync_state(username=username, last_completed_at=completed_at, last_error=None, continuation_page=None)
@@ -539,6 +554,30 @@ def import_discogs_selection(instance_ids: set[int]) -> dict:
         raise
     finally:
         DISCOGS_SYNC_LOCK.release()
+
+
+def import_progress() -> dict:
+    with IMPORT_PROGRESS_LOCK:
+        return dict(IMPORT_PROGRESS)
+
+
+def start_discogs_import(instance_ids: set[int]) -> None:
+    with IMPORT_PROGRESS_LOCK:
+        if IMPORT_PROGRESS["state"] == "running":
+            raise DiscogsAPIError("A Discogs import is already in progress.")
+        IMPORT_PROGRESS.update(state="running", completed=0, total=len(instance_ids), error=None)
+    def report(completed: int, total: int) -> None:
+        with IMPORT_PROGRESS_LOCK:
+            IMPORT_PROGRESS.update(completed=completed, total=total)
+    def work() -> None:
+        try:
+            result = import_discogs_selection(instance_ids, report)
+            with IMPORT_PROGRESS_LOCK:
+                IMPORT_PROGRESS.update(state="completed", result=result)
+        except Exception as error:
+            with IMPORT_PROGRESS_LOCK:
+                IMPORT_PROGRESS.update(state="failed", error=str(error))
+    threading.Thread(target=work, name="discogs-import", daemon=True).start()
 
 
 def sync_discogs_collection() -> dict:
@@ -624,6 +663,9 @@ class CrateHandler(SimpleHTTPRequestHandler):
         if path == "/api/discogs/status":
             self.send_json(discogs_status())
             return
+        if path == "/api/discogs/import-status":
+            self.send_json(import_progress())
+            return
         if path == "/api/discogs/collection-preview":
             try:
                 self.send_json({"ok": True, **collection_preview()})
@@ -682,7 +724,8 @@ class CrateHandler(SimpleHTTPRequestHandler):
                 instance_ids = {item for item in selected if isinstance(item, int)}
                 if len(instance_ids) != len(selected):
                     raise ValueError("Invalid Discogs collection selection.")
-                self.send_json({"ok": True, **import_discogs_selection(instance_ids)})
+                start_discogs_import(instance_ids)
+                self.send_json({"ok": True, "state": "started"}, HTTPStatus.ACCEPTED)
             except (json.JSONDecodeError, ValueError, TypeError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             except DiscogsAPIError as error:

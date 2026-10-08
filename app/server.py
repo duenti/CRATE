@@ -281,7 +281,7 @@ def database_state(db: sqlite3.Connection) -> dict:
         formats = [format_row["name"] + (f" · {format_row['text']}" if format_row["text"] else "") + (f" · {', '.join(json.loads(format_row['descriptions_json']))}" if format_row["descriptions_json"] else "") for format_row in db.execute("SELECT * FROM record_formats WHERE record_id = ? ORDER BY position", (row["id"],))]
         genres = [item["name"] for item in db.execute("SELECT g.name FROM record_genres rg JOIN genres g ON g.id = rg.genre_id WHERE rg.record_id = ? ORDER BY rg.position", (row["id"],))]
         styles = [item["name"] for item in db.execute("SELECT s.name FROM record_styles rs JOIN styles s ON s.id = rs.style_id WHERE rs.record_id = ? ORDER BY rs.position", (row["id"],))]
-        tracks = [{"position": track["discogs_position"], "title": track["title"], "duration": track["duration_text"]} for track in db.execute("SELECT discogs_position, title, duration_text FROM tracks WHERE record_id = ? ORDER BY position_index", (row["id"],))]
+        tracks = [{"id": track["id"], "position": track["discogs_position"], "title": track["title"], "duration": track["duration_text"]} for track in db.execute("SELECT id, discogs_position, title, duration_text FROM tracks WHERE record_id = ? ORDER BY position_index", (row["id"],))]
         records.append({"id": row["id"], "title": row["title"], "artists": ", ".join(artists), "year": row["year"], "country": row["country"], "formats": formats, "genres": genres, "styles": styles, "tracks": tracks, "coverImage": row["cover_image_url"], "addedAt": row["added_at"]})
     return {
         "schemaVersion": SCHEMA_VERSION,
@@ -289,7 +289,8 @@ def database_state(db: sqlite3.Connection) -> dict:
         "tracks": [],
         "settings": settings,
         # Compatibility placeholders until the browser UI is updated in step 3.
-        "crates": [], "sets": [], "activeSet": None, "currentId": None,
+        "crates": [{"id": crate["id"], "name": crate["name"], "trackIds": [track["track_id"] for track in db.execute("SELECT track_id FROM crate_tracks WHERE crate_id = ? ORDER BY position", (crate["id"],))], "defaultTonight": bool(crate["default_tonight"])} for crate in db.execute("SELECT id, name, default_tonight FROM crates ORDER BY created_at, name")],
+        "sets": [], "activeSet": None, "currentId": None,
         "history": [], "matchingSettings": {}, "has_state": True,
         "discogsTokenConfigured": bool(db.execute("SELECT 1 FROM app_settings WHERE key = 'discogs_token' AND value != ''").fetchone()),
     }
@@ -713,6 +714,44 @@ class CrateHandler(SimpleHTTPRequestHandler):
                 self.send_json({"ok": True, **result})
             except DiscogsAPIError as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_GATEWAY)
+            return
+        if path == "/api/crates/add-tracks":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("Invalid crate request.")
+                track_ids = payload.get("trackIds")
+                crate_id = payload.get("crateId")
+                crate_name = payload.get("crateName")
+                if not isinstance(track_ids, list) or not track_ids or not all(isinstance(item, str) for item in track_ids):
+                    raise ValueError("Select at least one track.")
+                if crate_id is not None and not isinstance(crate_id, str):
+                    raise ValueError("Invalid crate.")
+                if crate_name is not None and (not isinstance(crate_name, str) or not crate_name.strip()):
+                    raise ValueError("Give the new crate a name.")
+                with WRITE_LOCK, connect() as db:
+                    known_tracks = {row["id"] for row in db.execute(f"SELECT id FROM tracks WHERE id IN ({','.join('?' for _ in track_ids)})", track_ids)}
+                    if known_tracks != set(track_ids):
+                        raise ValueError("One or more tracks no longer exist.")
+                    now = int(time.time() * 1000)
+                    if crate_name is not None:
+                        crate_id = f"crate-{now}"
+                        db.execute("INSERT INTO crates(id, name, default_tonight, created_at, updated_at) VALUES (?, ?, 0, ?, ?)", (crate_id, crate_name.strip(), now, now))
+                    elif not crate_id or not db.execute("SELECT 1 FROM crates WHERE id = ?", (crate_id,)).fetchone():
+                        raise ValueError("Choose an existing crate or create a new one.")
+                    next_position = db.execute("SELECT COALESCE(MAX(position) + 1, 0) AS value FROM crate_tracks WHERE crate_id = ?", (crate_id,)).fetchone()["value"]
+                    added = 0
+                    for track_id in track_ids:
+                        if not db.execute("SELECT 1 FROM crate_tracks WHERE crate_id = ? AND track_id = ?", (crate_id, track_id)).fetchone():
+                            db.execute("INSERT INTO crate_tracks(crate_id, track_id, position) VALUES (?, ?, ?)", (crate_id, track_id, next_position))
+                            next_position += 1
+                            added += 1
+                    db.execute("UPDATE crates SET updated_at = ? WHERE id = ?", (now, crate_id))
+                    crate = db.execute("SELECT name FROM crates WHERE id = ?", (crate_id,)).fetchone()
+                self.send_json({"ok": True, "crateId": crate_id, "crateName": crate["name"], "added": added})
+            except (json.JSONDecodeError, ValueError, TypeError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
         if path == "/api/discogs/import":
             try:

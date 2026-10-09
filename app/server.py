@@ -753,6 +753,31 @@ class CrateHandler(SimpleHTTPRequestHandler):
             except (json.JSONDecodeError, ValueError, TypeError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
+        if path == "/api/tracks/update":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length))
+                track_id = payload.get("id") if isinstance(payload, dict) else None
+                fields = payload.get("fields") if isinstance(payload, dict) else None
+                if not isinstance(track_id, str) or not isinstance(fields, dict):
+                    raise ValueError("Invalid track update.")
+                columns = {"Track Name": "title", "Tempo": "tempo", "Key": "spotify_key", "Mode": "spotify_mode", "Popularity": "popularity", "Danceability": "danceability", "Energy": "spotify_energy", "Loudness": "loudness", "Speechiness": "speechiness", "Acousticness": "acousticness", "Instrumentalness": "instrumentalness", "Liveness": "liveness", "Valence": "valence", "Time Signature": "time_signature", "DJ Energy (1–5)": "dj_energy", "Funkiness (1–5)": "funkiness", "Heaviness (1–5)": "heaviness", "Psychedelia (1–5)": "psychedelia", "Vocal Intensity (0–3)": "vocal_intensity", "Mixability (1–5)": "mixability", "DJ Rating (1–5)": "dj_rating", "DJ Notes": "dj_notes", "Goes Well Into": "goes_well_into"}
+                with WRITE_LOCK, connect() as db:
+                    if not db.execute("SELECT 1 FROM tracks WHERE id = ?", (track_id,)).fetchone():
+                        raise ValueError("Track not found.")
+                    values = {column: value_or_none(fields.get(label)) for label, column in columns.items() if label in fields}
+                    if values:
+                        values["updated_at"] = int(time.time() * 1000)
+                        db.execute(f"UPDATE tracks SET {', '.join(f'{column} = ?' for column in values)} WHERE id = ?", (*values.values(), track_id))
+                    write_relation(db, "track_genres", "genres", track_id, split_values(fields.get("Genres")))
+                    write_relation(db, "track_styles", "styles", track_id, split_values(fields.get("Subgenre / Style")))
+                    write_relation(db, "track_tags", "tags", track_id, split_values(fields.get("Tags")))
+                    for label, relation_table, entity_table in [("Mood", "track_moods", "moods"), ("Groove", "track_grooves", "grooves"), ("Vocals", "track_vocals", "vocals"), ("Set Role", "track_set_roles", "set_roles"), ("Intro", "track_intros", "intros"), ("Outro", "track_outros", "outros")]:
+                        write_relation(db, relation_table, entity_table, track_id, split_values(fields.get(label)))
+                self.send_json({"ok": True})
+            except (json.JSONDecodeError, ValueError, TypeError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/discogs/import":
             try:
                 length = int(self.headers.get("Content-Length", "0"))

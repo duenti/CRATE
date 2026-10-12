@@ -753,6 +753,32 @@ class CrateHandler(SimpleHTTPRequestHandler):
             except (json.JSONDecodeError, ValueError, TypeError) as error:
                 self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
+        if path == "/api/crates/toggle-track":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length))
+                crate_id = payload.get("crateId") if isinstance(payload, dict) else None
+                track_id = payload.get("trackId") if isinstance(payload, dict) else None
+                if not isinstance(crate_id, str) or not isinstance(track_id, str):
+                    raise ValueError("Invalid crate track request.")
+                with WRITE_LOCK, connect() as db:
+                    if not db.execute("SELECT 1 FROM crates WHERE id = ?", (crate_id,)).fetchone():
+                        raise ValueError("Crate not found.")
+                    if not db.execute("SELECT 1 FROM tracks WHERE id = ?", (track_id,)).fetchone():
+                        raise ValueError("Track not found.")
+                    exists = db.execute("SELECT 1 FROM crate_tracks WHERE crate_id = ? AND track_id = ?", (crate_id, track_id)).fetchone()
+                    if exists:
+                        db.execute("DELETE FROM crate_tracks WHERE crate_id = ? AND track_id = ?", (crate_id, track_id))
+                        included = False
+                    else:
+                        position = db.execute("SELECT COALESCE(MAX(position) + 1, 0) AS value FROM crate_tracks WHERE crate_id = ?", (crate_id,)).fetchone()["value"]
+                        db.execute("INSERT INTO crate_tracks(crate_id, track_id, position) VALUES (?, ?, ?)", (crate_id, track_id, position))
+                        included = True
+                    db.execute("UPDATE crates SET updated_at = ? WHERE id = ?", (int(time.time() * 1000), crate_id))
+                self.send_json({"ok": True, "included": included})
+            except (json.JSONDecodeError, ValueError, TypeError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/tracks/update":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
